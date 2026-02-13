@@ -1,10 +1,10 @@
-# Llama 3.2 3B AOTInductor Artifact (`torch.export` -> `.pt2`)
+# Llama 3.2 3B AOTInductor Artifact (`torch.export` -> `.pt2`, KV cache)
 
-This folder implements a true ahead-of-time deployment artifact flow:
+This folder implements an ahead-of-time deployment artifact flow with KV-cache generation:
 
-1. `torch.export.export(...)` to capture an `ExportedProgram`
-2. `torch._inductor.aoti_compile_and_package(...)` to create a `.pt2` package
-3. `torch._inductor.aoti_load_package(...)` for runtime inference
+1. Export `prefill` and `decode` wrappers with `torch.export.export(...)`
+2. Compile each wrapper with `torch._inductor.aoti_compile_and_package(...)`
+3. Load artifact(s) with `torch._inductor.aoti_load_package(...)` at runtime
 
 ## Environment
 
@@ -20,6 +20,7 @@ This folder implements a true ahead-of-time deployment artifact flow:
 Default output:
 
 - `artifacts/llama3b_aotinductor.pt2`
+- `artifacts/llama3b_aotinductor_decode.pt2`
 - `artifacts/llama3b_aotinductor_meta.json`
 
 Equivalent direct command:
@@ -57,7 +58,7 @@ Explicitly force package preload path:
 
 `run.sh` modes:
 
-- `--load-artifacts` (default): compile_preload (`aoti_load_package` from prebuilt `.pt2`)
+- `--load-artifacts` (default): compile_preload (`aoti_load_package` from prebuilt `.pt2` artifacts)
 - `--no-load-artifacts`: compile_no_preload (`torch.compile` at runtime, then run)
 
 Compare both modes (completion text + timing) in isolated cold-start subprocesses:
@@ -70,9 +71,10 @@ Optional: add `--show-completions` to print generated text per trial.
 
 Default compare output (without `--show-completions`) includes:
 
-- Per-trial: `setup`, `generation`, `script_total`, and subprocess `wall` time.
+- Per-trial: `setup`, `generation`, `script_total`, subprocess `wall` time, `new_tokens`, and `gen_tps`.
 - Summary averages for load vs skip, including setup/generation/total speedups.
 - Compile/cache counters: average `unique_graphs` and `async_compile_miss`.
+- Generation time is compute-only; artifact prefill/decode load is counted in setup.
 
 Equivalent direct command:
 
@@ -81,15 +83,17 @@ python run_llama_aotinductor.py \
   --package-path artifacts/llama3b_aotinductor.pt2 \
   --metadata-path artifacts/llama3b_aotinductor_meta.json \
   --model-id meta-llama/Llama-3.2-3B-Instruct \
-  --bucket-pad \
   --prompt "Write a short explanation of portable torch.compile caches." \
   --max-new-tokens 128
 ```
 
+Bucket padding is opt-in. Add `--bucket-pad` (or `--prefill-buckets ...`) only when you want prompt length rounded to export buckets.
+
 ## Notes
 
-- The exported wrapper compiles `forward(input_ids, attention_mask) -> logits`.
-- Runtime generation here uses a simple greedy autoregressive loop (no KV cache), intended as a clean artifact-loading example.
+- Runtime generation uses a greedy KV-cache loop: prefill once, then decode token-by-token with cached keys/values.
+- Build produces two artifacts: prefill and decode.
+- Preload runtime uses staged package loading (prefill then decode) to avoid loading both large artifacts on GPU at once.
 - `build.sh` now defaults to dynamic-sequence export with `dynamic_seq_multiple=8`.
 - To force static export fallback, pass `--no-dynamic-seq-len` to `./build.sh` and keep runtime `--max-new-tokens 1`.
 - Since this is `torch.export`-based, model/export graph compatibility matters more than `torch.compile` mega-cache flow.
@@ -111,8 +115,9 @@ Implementation detail in this repo:
 
 - `build_llama_aotinductor.py` applies a masking workaround by default (`--masking-workaround`) for current `transformers==4.57.x` dynamic export behavior.
 - Dynamic sequence dim uses `torch.export.Dim` with optional derived multiple (default `--dynamic-seq-multiple 8`).
-- `dynamic_shapes=({1: seq_dim}, {1: seq_dim})` for `(input_ids, attention_mask)`
-- `run_llama_aotinductor.py` auto-pads per-step inputs to the exported multiple and reads logits from the true (unpadded) token position, so `--max-new-tokens > 1` works for dynamic packages.
+- Prefill export uses `dynamic_shapes=({1: seq_dim}, {1: seq_dim})` for `(input_ids, attention_mask)`.
+- Decode export uses dynamic cache-length guards and attention-mask length `past_len + 1`.
+- Runtime auto-pads prefill inputs to the exported multiple and trims cache tensors back to true prompt length before decode.
 
 Example dynamic run with multi-token generation:
 
@@ -140,8 +145,8 @@ If dynamic export still fails for your exact stack/model, keep static export as 
 
 This folder now includes `benchmark_llama_modes.py` and `benchmark.sh` with three modes:
 
-- `compile_preload`: load prebuilt `.pt2` and run inference
-- `compile_no_preload`: runtime `torch.compile` (no `.pt2` load), then run inference
+- `compile_preload`: load prebuilt prefill/decode `.pt2` artifacts and run inference
+- `compile_no_preload`: runtime `torch.compile` for prefill/decode wrappers (no `.pt2` load), then run inference
 - `eager`: plain HF `generate(..., disable_compile=True)`
 
 `benchmark.sh` is intentionally separate from `run.sh`; both now use runtime `torch.compile` for `compile_no_preload`.
