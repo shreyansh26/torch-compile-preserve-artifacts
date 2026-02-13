@@ -9,6 +9,6 @@ python benchmark_llama_modes.py \
     --bucket-pad \
     --prompt "Write a short explanation of portable torch.compile caches." \
     --max-new-tokens 128 \
-    --num-requests 3 \
-    --repeats 1 \
+    --num-requests 50 \
+    --repeats 2 \
     "$@"
