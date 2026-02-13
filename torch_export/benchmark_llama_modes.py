@@ -26,7 +26,7 @@ from aot_export_utils import (
 )
 
 BENCH_PREFIX = "BENCH_JSON:"
-MODES = ("compile_preload", "compile_no_preload", "eager")
+MODES = ("eager", "compile_preload", "compile_no_preload")
 
 
 def parse_args() -> argparse.Namespace:
@@ -505,12 +505,13 @@ def make_single_mode_metrics(args: argparse.Namespace, mode: str) -> dict[str, A
             compile_mode = "max-autotune" if args.max_autotune else "default"
             print(
                 "[bench] mode=compile_no_preload: compiling model with torch.compile "
-                f"(dynamic_seq_len={dynamic_seq_len}, compile_mode={compile_mode})"
+                f"(dynamic_seq_len={dynamic_seq_len}, compile_mode={compile_mode}, fullgraph=True)"
             )
             build_start = time.perf_counter()
             compiled_model = torch.compile(
                 wrapped,
                 mode=compile_mode,
+                fullgraph=True,
                 dynamic=dynamic_seq_len,
             )
             with torch.inference_mode():
@@ -525,7 +526,7 @@ def make_single_mode_metrics(args: argparse.Namespace, mode: str) -> dict[str, A
                 f" (dynamic_seq_len={dynamic_seq_len}, "
                 f"dynamic_seq_multiple={dynamic_seq_multiple}, "
                 f"reference_seq=[{effective_min_seq_len}, {effective_max_seq_len}], "
-                f"compile_mode={compile_mode})"
+                f"compile_mode={compile_mode}, fullgraph=True)"
             )
 
         eos_token_id = tokenizer.eos_token_id

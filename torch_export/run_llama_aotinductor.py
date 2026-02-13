@@ -549,13 +549,15 @@ def run_no_preload_mode(args: argparse.Namespace, device: torch.device) -> dict[
     compile_mode = "max-autotune" if args.max_autotune else "default"
     print(
         "[run] compiling model at runtime with torch.compile "
-        f"(dtype={dtype_name}, mode={compile_mode}, dynamic={args.compile_dynamic_seq_len})"
+        f"(dtype={dtype_name}, mode={compile_mode}, dynamic={args.compile_dynamic_seq_len}, "
+        "fullgraph=True)"
     )
     counters.clear()
     build_start = time.perf_counter()
     compiled_model = torch.compile(
         wrapped,
         mode=compile_mode,
+        fullgraph=True,
         dynamic=args.compile_dynamic_seq_len,
     )
     with torch.inference_mode():
@@ -623,6 +625,7 @@ def run_no_preload_mode(args: argparse.Namespace, device: torch.device) -> dict[
         "new_tokens": len(generated_ids),
         "prompt_tokens_original": original_tokens,
         "prompt_tokens_effective": effective_tokens,
+        "fullgraph": True,
         **counter_metrics,
     }
 

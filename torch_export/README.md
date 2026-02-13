@@ -131,6 +131,7 @@ If dynamic export still fails for your exact stack/model, keep static export as 
 
 - `--dynamic-seq-len` is a build/export flag (`build_llama_aotinductor.py`) and controls whether the `.pt2` artifact is exported with dynamic sequence guards.
 - `--compile-dynamic-seq-len` is a runtime compile flag (`run_llama_aotinductor.py` / `benchmark_llama_modes.py`) and controls `torch.compile(dynamic=...)` in `compile_no_preload` mode.
+- In `compile_no_preload` mode, `torch.compile` is run with `fullgraph=True` by default in both run and benchmark flows (no `--no-fullgraph` toggle in `torch_export` scripts).
 - `build.sh` uses `--dynamic-seq-len` (export-time behavior), not `--compile-dynamic-seq-len`.
 - `run.sh` does not pass `--compile-dynamic-seq-len` explicitly because `run_llama_aotinductor.py` defaults it to enabled; override with `./run.sh --no-load-artifacts --no-compile-dynamic-seq-len` if needed.
 - `benchmark.sh` passes `--compile-dynamic-seq-len` explicitly because benchmark defaults keep that flag off unless requested.
