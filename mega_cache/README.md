@@ -74,6 +74,14 @@ python run_llama_with_portable_cache.py \
   --compare-runs 2
 ```
 
+Optional: add `--show-completions` to print generated text per trial.
+
+Default compare output (without `--show-completions`) includes:
+
+- Per-trial: `generation`, `script_total`, and subprocess `wall` time.
+- Summary averages for load vs skip, including setup/generation/total speedups.
+- Compile/cache counters: average `unique_graphs` and `async_compile_miss`.
+
 If you only want one mode:
 
 - With preload (default): `--load-artifacts`
