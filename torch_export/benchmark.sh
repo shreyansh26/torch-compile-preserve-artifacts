@@ -5,7 +5,11 @@ python benchmark_llama_modes.py \
     --cache-implementation static \
     --bucket-pad \
     --prompt "Write a short explanation of portable torch.compile caches." \
-    --max-new-tokens 1 \
-    --num-requests 3 \
-    --repeats 1 \
+    --max-new-tokens 128 \
+    --num-requests 50 \
+    --repeats 2 \
+    --compile-dynamic-seq-len \
+    --min-seq-len 1 \
+    --max-seq-len 2048 \
+    --dynamic-seq-multiple 8 \
     "$@"
