@@ -133,13 +133,55 @@ cd mega_cache
 - Use `torch_export` when you want a deployable artifact with bounded dynamic-shape behavior and predictable runtime execution.
 - Use `mega_cache` when you want to stay in HF `generate` + `torch.compile` flow and are willing to manage warmup buckets/cache-key matching for best hit rates.
 
-### 6) Practical Findings From Fresh Compare Runs
+### 6) Practical Findings From Compare Runs
 
 - `torch_export` preload is the most logical cold-path winner in this repo: it loads an already compiled `.pt2` package and typically shows near-zero runtime compile misses in preload mode.
 - `torch_export` no-preload is intentionally expensive because it compiles at runtime, so setup and first-run generation are much slower than preload.
 - `mega_cache` preload improves generation versus skip, but setup load-vs-skip often remains close because most work still happens in runtime `generate` compile/autotune paths.
 - Even with preload, `mega_cache` can still show compile misses; this is expected because it is cache-key reuse over runtime compilation, not an AOT packaged executable graph.
 - Bottom line: if your priority is lowest cold-start latency and strongest predictability, prefer `torch_export`; if your priority is staying in native HF `generate` workflow with incremental cache reuse, use `mega_cache`.
+
+### 7) Structured Compare Snapshot
+
+Run context (fresh local compare runs):
+
+- Model: `meta-llama/Llama-3.2-3B-Instruct`
+- Prompt: `"Write a short explanation of portable torch.compile caches."`
+- Generated tokens: `max_new_tokens=128`
+- Compare trials: `2` per mode (`load` vs `skip`)
+- Compiler caches: isolated per trial
+- Date: local run snapshot captured during this repo iteration
+
+Mode-specific config:
+
+- `mega_cache`: `cache_implementation=static`, `compile_mode=max-autotune`, `compile_dynamic=auto`, `fullgraph=True`
+- `torch_export` preload: load prebuilt `.pt2`
+- `torch_export` no-preload: runtime `torch.compile` with dynamic enabled (`--compile-dynamic-seq-len`) and `max-autotune` and `fullgraph=True`
+
+`mega_cache` (`./compare.sh`) summary:
+
+| Metric | Load Artifacts | Skip Artifacts | Load Benefit |
+| --- | ---: | ---: | ---: |
+| setup avg (s) | 3.00 | 2.91 | 0.97x |
+| generation avg (s) | 20.40 | 43.42 | 2.13x |
+| total script avg (s) | 25.08 | 47.96 | 1.91x |
+| avg unique_graphs | 1.00 | 1.00 | - |
+| avg async_compile_miss | 75.00 | 50.00 | - |
+
+`torch_export` (`./compare.sh`) summary:
+
+| Metric | Load Artifacts | Skip Artifacts | Load Benefit |
+| --- | ---: | ---: | ---: |
+| setup avg (s) | 8.25 | 133.53 | 16.18x |
+| generation avg (s) | 2.09 | 12.57 | 6.02x |
+| total script avg (s) | 10.76 | 146.34 | 13.59x |
+| avg unique_graphs | 0.00 | 2.00 | - |
+| avg async_compile_miss | 0.00 | 605.00 | - |
+
+Interpretation:
+
+- `torch_export` load mode behaves like true AOT runtime (minimal compile misses), so both setup and generation are strongly improved versus skip.
+- `mega_cache` load mode improves generation but does not eliminate runtime compile activity; setup load-vs-skip may remain close while generation/total still benefit.
 
 ## Metric Naming (Shared Across Both Benchmarks)
 
