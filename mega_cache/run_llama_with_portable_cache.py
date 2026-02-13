@@ -130,6 +130,18 @@ def parse_args() -> argparse.Namespace:
         help="Number of cold-start trials per mode for --compare-load-vs-skip.",
     )
     parser.add_argument(
+        "--show-completions",
+        action="store_true",
+        default=False,
+        help="Print generated completion text during compare mode.",
+    )
+    parser.add_argument(
+        "--no-show-completions",
+        dest="show_completions",
+        action="store_false",
+        help="Disable completion text printing during compare mode.",
+    )
+    parser.add_argument(
         "--fullgraph",
         dest="fullgraph",
         action="store_true",
@@ -355,10 +367,11 @@ def run_single_inference(args: argparse.Namespace) -> dict[str, Any]:
 
     prompt_len = encoded["input_ids"].shape[1]
     completion = tokenizer.decode(output_ids[0][prompt_len:], skip_special_tokens=True)
+    completion = completion.strip()
     print("\n=== Prompt ===")
     print(args.prompt)
     print("\n=== Completion ===")
-    print(completion.strip())
+    print(completion)
     print(f"\n[run] end-to-end generation latency: {elapsed:.2f}s")
     compile_stats = dict(counters.get("stats", {}))
     inductor_stats = dict(counters.get("inductor", {}))
@@ -387,6 +400,7 @@ def run_single_inference(args: argparse.Namespace) -> dict[str, Any]:
         "artifact_bytes": artifact_bytes,
         "artifact_load_seconds": artifact_load_seconds,
         "model_load_seconds": model_load_seconds,
+        "setup_seconds": artifact_load_seconds + model_load_seconds,
         "generation_seconds": elapsed,
         "prompt_tokens": int(prompt_len),
         "prompt_tokens_original": int(original_prompt_tokens),
@@ -409,6 +423,7 @@ def run_single_inference(args: argparse.Namespace) -> dict[str, Any]:
         "fullgraph": bool(args.fullgraph),
         "dtype": dtype_name,
         "model_id": args.model_id,
+        "completion": completion,
     }
     if args.emit_json_metrics:
         print(f"{METRICS_PREFIX}{json.dumps(metrics, sort_keys=True)}")
@@ -506,11 +521,15 @@ def run_compare_mode(args: argparse.Namespace) -> None:
                     f"script_total={metrics['total_script_seconds']:.2f}s, "
                     f"wall={wall_elapsed:.2f}s"
                 )
+                if args.show_completions:
+                    print(f"[compare] completion({mode_name}): {metrics.get('completion', '')}")
             finally:
                 shutil.rmtree(temp_root, ignore_errors=True)
 
     load_gen = [m["generation_seconds"] for m in results_by_mode["load"]]
     skip_gen = [m["generation_seconds"] for m in results_by_mode["skip"]]
+    load_setup = [m.get("setup_seconds", 0.0) for m in results_by_mode["load"]]
+    skip_setup = [m.get("setup_seconds", 0.0) for m in results_by_mode["skip"]]
     load_total = [m["total_script_seconds"] for m in results_by_mode["load"]]
     skip_total = [m["total_script_seconds"] for m in results_by_mode["skip"]]
     load_graphs = [m.get("unique_graphs", 0) for m in results_by_mode["load"]]
@@ -520,10 +539,20 @@ def run_compare_mode(args: argparse.Namespace) -> None:
 
     mean_load_gen = statistics.mean(load_gen)
     mean_skip_gen = statistics.mean(skip_gen)
+    mean_load_setup = statistics.mean(load_setup)
+    mean_skip_setup = statistics.mean(skip_setup)
     mean_load_total = statistics.mean(load_total)
     mean_skip_total = statistics.mean(skip_total)
 
     print("\n=== Comparison Summary ===")
+    print(f"setup (load artifacts): {mean_load_setup:.2f}s avg over {len(load_setup)} run(s)")
+    print(f"setup (skip artifacts): {mean_skip_setup:.2f}s avg over {len(skip_setup)} run(s)")
+    print(
+        "setup speedup from load artifacts: "
+        f"{mean_skip_setup / mean_load_setup:.2f}x"
+        if mean_load_setup > 0
+        else "setup speedup from load artifacts: n/a"
+    )
     print(f"generation (load artifacts): {mean_load_gen:.2f}s avg over {len(load_gen)} run(s)")
     print(f"generation (skip artifacts): {mean_skip_gen:.2f}s avg over {len(skip_gen)} run(s)")
     print(
