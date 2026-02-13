@@ -672,10 +672,18 @@ def run_parent_benchmark(args: argparse.Namespace) -> None:
         f"{MODES}, requests_per_mode={args.num_requests}, repeats={args.repeats}"
     )
     all_results: dict[str, list[dict[str, Any]]] = {mode: [] for mode in MODES}
+    tmp_root_dir = os.environ.get("TMPDIR")
+    if tmp_root_dir:
+        Path(tmp_root_dir).mkdir(parents=True, exist_ok=True)
 
     for mode in MODES:
         for repeat in range(1, args.repeats + 1):
-            temp_root = Path(tempfile.mkdtemp(prefix=f"aot_bench_{mode}_{repeat}_"))
+            temp_root = Path(
+                tempfile.mkdtemp(
+                    prefix=f"aot_bench_{mode}_{repeat}_",
+                    dir=tmp_root_dir,
+                )
+            )
             try:
                 env = os.environ.copy()
                 if args.isolate_compiler_caches:
