@@ -9,8 +9,10 @@ import torch
 
 from aot_export_utils import (
     CausalLMLogitsWrapper,
+    apply_transformers_masking_workaround,
     load_model_and_tokenizer,
     require_cuda,
+    resolve_dynamic_seq_dim,
     resolve_dtype,
     runtime_fingerprint,
     write_json,
@@ -81,6 +83,31 @@ def parse_args() -> argparse.Namespace:
         help="Maximum sequence length guard for dynamic export.",
     )
     parser.add_argument(
+        "--dynamic-seq-multiple",
+        type=int,
+        default=8,
+        help=(
+            "Dynamic sequence lengths must be multiples of this value. "
+            "Use 1 to disable. Default 8 is a practical workaround for current "
+            "torch.export+transformers constraints."
+        ),
+    )
+    parser.add_argument(
+        "--masking-workaround",
+        action="store_true",
+        default=True,
+        help=(
+            "Apply transformers masking workaround for dynamic export "
+            "(recommended on torch==2.9.1 / transformers==4.57.x)."
+        ),
+    )
+    parser.add_argument(
+        "--no-masking-workaround",
+        dest="masking_workaround",
+        action="store_false",
+        help="Disable transformers masking workaround.",
+    )
+    parser.add_argument(
         "--max-autotune",
         action="store_true",
         default=True,
@@ -119,6 +146,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--max-seq-len must be positive")
     if args.max_seq_len < args.min_seq_len:
         raise ValueError("--max-seq-len must be >= --min-seq-len")
+    if args.dynamic_seq_multiple <= 0:
+        raise ValueError("--dynamic-seq-multiple must be positive")
     return args
 
 
@@ -142,16 +171,27 @@ def main() -> None:
     attention_mask = encoded["attention_mask"].to(device)
 
     dynamic_shapes: Any = None
+    effective_min_seq_len = args.min_seq_len
+    effective_max_seq_len = args.max_seq_len
+    masking_workaround_applied = False
     if args.dynamic_seq_len:
-        seq_dim = torch.export.Dim(
-            "seq_len",
-            min=args.min_seq_len,
-            max=args.max_seq_len,
+        if args.masking_workaround:
+            masking_workaround_applied = apply_transformers_masking_workaround()
+            print(
+                "[build] masking workaround "
+                f"{'applied' if masking_workaround_applied else 'not applied'}"
+            )
+        seq_dim, effective_min_seq_len, effective_max_seq_len = resolve_dynamic_seq_dim(
+            min_seq_len=args.min_seq_len,
+            max_seq_len=args.max_seq_len,
+            seq_multiple=args.dynamic_seq_multiple,
         )
         dynamic_shapes = ({1: seq_dim}, {1: seq_dim})
         print(
             "[build] dynamic export enabled: "
-            f"seq_len in [{args.min_seq_len}, {args.max_seq_len}]"
+            f"requested=[{args.min_seq_len}, {args.max_seq_len}], "
+            f"effective=[{effective_min_seq_len}, {effective_max_seq_len}], "
+            f"multiple={args.dynamic_seq_multiple}"
         )
     else:
         print("[build] static export enabled.")
@@ -227,6 +267,11 @@ def main() -> None:
             "dynamic_seq_len": args.dynamic_seq_len,
             "min_seq_len": args.min_seq_len,
             "max_seq_len": args.max_seq_len,
+            "effective_min_seq_len": effective_min_seq_len,
+            "effective_max_seq_len": effective_max_seq_len,
+            "dynamic_seq_multiple": args.dynamic_seq_multiple,
+            "masking_workaround_requested": args.masking_workaround,
+            "masking_workaround_applied": masking_workaround_applied,
             "seconds": export_seconds,
         },
         "aot_compile": {
