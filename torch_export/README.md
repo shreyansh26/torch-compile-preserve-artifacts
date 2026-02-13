@@ -70,7 +70,7 @@ Optional: add `--show-completions` to print generated text per trial.
 
 Default compare output (without `--show-completions`) includes:
 
-- Per-trial: `setup`, `generation`, `script_total`, and subprocess `wall` time.
+- Per-trial: `setup`, `generation`, `script_total`, subprocess `wall` time, `new_tokens`, and `gen_tps`.
 - Summary averages for load vs skip, including setup/generation/total speedups.
 - Compile/cache counters: average `unique_graphs` and `async_compile_miss`.
 
@@ -165,6 +165,12 @@ Quick cold-start comparison (2 repeats, 1 request per run):
 
 ```bash
 ./compare.sh
+```
+
+If `/tmp` is space-constrained, set `TMPDIR` to a larger path before compare so isolated cache dirs are created there:
+
+```bash
+TMPDIR=/path/with/space ./compare.sh
 ```
 
 Equivalent direct benchmark command:
