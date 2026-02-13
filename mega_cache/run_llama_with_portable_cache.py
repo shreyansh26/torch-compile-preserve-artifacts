@@ -285,6 +285,12 @@ def maybe_bucket_pad_inputs(
     return padded, original_prompt_tokens, target
 
 
+def safe_tps(tokens: int, seconds: float) -> float:
+    if tokens <= 0 or seconds <= 0:
+        return 0.0
+    return float(tokens / max(1e-9, seconds))
+
+
 def run_single_inference(args: argparse.Namespace) -> dict[str, Any]:
     overall_start = time.perf_counter()
     device = require_cuda()
@@ -479,10 +485,18 @@ def run_compare_mode(args: argparse.Namespace) -> None:
     )
     results_by_mode: dict[str, list[dict[str, Any]]] = {"load": [], "skip": []}
     mode_plan = [("load", True), ("skip", False)]
+    tmp_root_dir = os.environ.get("TMPDIR")
+    if tmp_root_dir:
+        Path(tmp_root_dir).mkdir(parents=True, exist_ok=True)
 
     for mode_name, should_load in mode_plan:
         for trial in range(1, args.compare_runs + 1):
-            temp_root = Path(tempfile.mkdtemp(prefix=f"portable_cache_{mode_name}_{trial}_"))
+            temp_root = Path(
+                tempfile.mkdtemp(
+                    prefix=f"portable_cache_{mode_name}_{trial}_",
+                    dir=tmp_root_dir,
+                )
+            )
             try:
                 inductor_dir = temp_root / "inductor_cache"
                 triton_dir = temp_root / "triton_cache"
@@ -515,11 +529,15 @@ def run_compare_mode(args: argparse.Namespace) -> None:
                 metrics = extract_metrics_from_stdout(proc.stdout)
                 metrics["subprocess_wall_seconds"] = wall_elapsed
                 results_by_mode[mode_name].append(metrics)
+                trial_new_tokens = int(metrics.get("new_tokens", 0))
+                trial_tps = safe_tps(trial_new_tokens, float(metrics["generation_seconds"]))
                 print(
                     f"[compare] mode={mode_name} trial={trial}: "
                     f"generation={metrics['generation_seconds']:.2f}s, "
                     f"script_total={metrics['total_script_seconds']:.2f}s, "
-                    f"wall={wall_elapsed:.2f}s"
+                    f"wall={wall_elapsed:.2f}s, "
+                    f"new_tokens={trial_new_tokens}, "
+                    f"gen_tps={trial_tps:.2f}"
                 )
                 if args.show_completions:
                     print(f"[compare] completion({mode_name}): {metrics.get('completion', '')}")
@@ -536,6 +554,16 @@ def run_compare_mode(args: argparse.Namespace) -> None:
     skip_graphs = [m.get("unique_graphs", 0) for m in results_by_mode["skip"]]
     load_async_miss = [m.get("async_compile_miss", 0) for m in results_by_mode["load"]]
     skip_async_miss = [m.get("async_compile_miss", 0) for m in results_by_mode["skip"]]
+    load_tokens = [int(m.get("new_tokens", 0)) for m in results_by_mode["load"]]
+    skip_tokens = [int(m.get("new_tokens", 0)) for m in results_by_mode["skip"]]
+    load_tps = [
+        safe_tps(int(m.get("new_tokens", 0)), float(m.get("generation_seconds", 0.0)))
+        for m in results_by_mode["load"]
+    ]
+    skip_tps = [
+        safe_tps(int(m.get("new_tokens", 0)), float(m.get("generation_seconds", 0.0)))
+        for m in results_by_mode["skip"]
+    ]
 
     mean_load_gen = statistics.mean(load_gen)
     mean_skip_gen = statistics.mean(skip_gen)
@@ -543,6 +571,8 @@ def run_compare_mode(args: argparse.Namespace) -> None:
     mean_skip_setup = statistics.mean(skip_setup)
     mean_load_total = statistics.mean(load_total)
     mean_skip_total = statistics.mean(skip_total)
+    mean_load_tps = statistics.mean(load_tps)
+    mean_skip_tps = statistics.mean(skip_tps)
 
     print("\n=== Comparison Summary ===")
     print(f"setup (load artifacts): {mean_load_setup:.2f}s avg over {len(load_setup)} run(s)")
@@ -555,6 +585,10 @@ def run_compare_mode(args: argparse.Namespace) -> None:
     )
     print(f"generation (load artifacts): {mean_load_gen:.2f}s avg over {len(load_gen)} run(s)")
     print(f"generation (skip artifacts): {mean_skip_gen:.2f}s avg over {len(skip_gen)} run(s)")
+    print(f"new_tokens (load artifacts): {statistics.mean(load_tokens):.2f} avg")
+    print(f"new_tokens (skip artifacts): {statistics.mean(skip_tokens):.2f} avg")
+    print(f"generation token/s (load artifacts): {mean_load_tps:.2f}")
+    print(f"generation token/s (skip artifacts): {mean_skip_tps:.2f}")
     print(
         "generation speedup from load artifacts: "
         f"{mean_skip_gen / mean_load_gen:.2f}x"
