@@ -7,5 +7,5 @@ python run_llama_aotinductor.py \
     --model-id meta-llama/Llama-3.2-3B-Instruct \
     --bucket-pad \
     --prompt "Write a short explanation of portable torch.compile caches." \
-    --max-new-tokens 128 \
+    --max-new-tokens 256 \
     "$@"

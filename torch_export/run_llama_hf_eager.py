@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--bucket-pad",
         action="store_true",
-        default=True,
+        default=False,
         help="Pad prompt to nearest prefill bucket.",
     )
     parser.add_argument(

@@ -16,7 +16,11 @@ import torch
 from transformers import AutoTokenizer
 
 from aot_export_utils import (
-    CausalLMLogitsWrapper,
+    CausalLMDecodeWrapper,
+    CausalLMPrefillWrapper,
+    active_positions_from_attention_mask,
+    clone_flattened_kv_cache,
+    compact_flattened_kv_cache,
     load_model_and_tokenizer,
     pad_inputs_to_multiple,
     parse_positive_int_csv,
@@ -44,7 +48,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--package-path",
         default="artifacts/llama3b_aotinductor.pt2",
-        help="Path to prebuilt AOTInductor package for compile_preload mode.",
+        help="Path to prebuilt AOTInductor prefill package for compile_preload mode.",
+    )
+    parser.add_argument(
+        "--decode-package-path",
+        default="",
+        help=(
+            "Path to prebuilt AOTInductor decode package for compile_preload mode. "
+            "If empty, read from metadata or derive from --package-path."
+        ),
     )
     parser.add_argument(
         "--metadata-path",
@@ -95,7 +107,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--bucket-pad",
         action="store_true",
-        default=True,
+        default=False,
         help="Pad prompt to nearest bucket.",
     )
     parser.add_argument(
@@ -125,9 +137,7 @@ def parse_args() -> argparse.Namespace:
         "--compile-dynamic-seq-len",
         action="store_true",
         default=False,
-        help=(
-            "For compile_no_preload mode, set torch.compile(dynamic=True)."
-        ),
+        help="For compile_no_preload mode, set torch.compile(dynamic=True).",
     )
     parser.add_argument(
         "--example-seq-len",
@@ -145,16 +155,13 @@ def parse_args() -> argparse.Namespace:
         "--max-seq-len",
         type=int,
         default=2048,
-        help="Reference max sequence length used for compile_no_preload reporting.",
+        help="Reference max total sequence length used for compile_no_preload reporting.",
     )
     parser.add_argument(
         "--dynamic-seq-multiple",
         type=int,
         default=8,
-        help=(
-            "Pad per-step sequence length to this multiple "
-            "for compile_no_preload mode."
-        ),
+        help="Pad prefill sequence length to this multiple for compile_no_preload mode.",
     )
     parser.add_argument(
         "--max-autotune",
@@ -226,6 +233,31 @@ def safe_tps(tokens: int, seconds: float) -> float:
     return float(tokens / max(1e-9, seconds))
 
 
+def derive_decode_package_path(prefill_path: Path) -> Path:
+    suffix = prefill_path.suffix or ".pt2"
+    return prefill_path.with_name(f"{prefill_path.stem}_decode{suffix}")
+
+
+def load_metadata(metadata_path: Path) -> dict[str, Any]:
+    if not metadata_path.exists():
+        return {}
+    return json.loads(metadata_path.read_text(encoding="utf-8"))
+
+
+def resolve_package_paths(args: argparse.Namespace, metadata: dict[str, Any]) -> tuple[Path, Path]:
+    prefill_path = Path(args.package_path)
+    decode_path = None
+    if args.decode_package_path.strip():
+        decode_path = Path(args.decode_package_path)
+    else:
+        metadata_decode = metadata.get("decode_package_path")
+        if isinstance(metadata_decode, str) and metadata_decode.strip():
+            decode_path = Path(metadata_decode)
+    if decode_path is None:
+        decode_path = derive_decode_package_path(prefill_path)
+    return prefill_path, decode_path
+
+
 def resolve_prefill_buckets(args: argparse.Namespace, metadata: dict[str, Any]) -> list[int]:
     if args.prefill_buckets.strip():
         return parse_positive_int_csv(args.prefill_buckets)
@@ -271,50 +303,219 @@ def maybe_bucket_pad_inputs(
     return padded, original_prompt_tokens, target
 
 
-def load_metadata(metadata_path: Path) -> dict[str, Any]:
-    if not metadata_path.exists():
-        return {}
-    return json.loads(metadata_path.read_text(encoding="utf-8"))
+def split_prefill_outputs(outputs: Any) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+    logits = outputs[0]
+    cache = tuple(outputs[1:])
+    return logits, cache
 
 
-def run_aot_request(
-    compiled_model,
+def ensure_total_seq_limit(
+    *,
+    current_total_seq_len: int,
+    max_total_seq_len: int | None,
+) -> None:
+    if max_total_seq_len is None:
+        return
+    if current_total_seq_len > max_total_seq_len:
+        raise ValueError(
+            f"Total sequence length {current_total_seq_len} exceeded max {max_total_seq_len}. "
+            "Reduce prompt length or max_new_tokens, or rebuild with a larger max sequence length."
+        )
+
+
+def run_kv_request(
+    *,
+    prefill_runner,
+    decode_runner,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     max_new_tokens: int,
     stop_on_eos: bool,
     eos_token_id: int | None,
-    dynamic_seq_multiple: int = 1,
-    pad_token_id: int | None = None,
+    prefill_seq_multiple: int,
+    pad_token_id: int | None,
+    max_total_seq_len: int | None,
 ) -> tuple[list[int], float]:
     generated_ids: list[int] = []
-    req_input_ids = input_ids.clone()
-    req_attention_mask = attention_mask.clone()
+    prompt_input_ids = input_ids.clone()
+    prompt_attention_mask = attention_mask.clone()
+    prompt_seq_len = int(prompt_input_ids.shape[1])
 
     start = time.perf_counter()
     with torch.inference_mode():
-        for _ in range(max_new_tokens):
+        ensure_total_seq_limit(
+            current_total_seq_len=prompt_seq_len,
+            max_total_seq_len=max_total_seq_len,
+        )
+        if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+            torch.compiler.cudagraph_mark_step_begin()
+        prefill_input_ids, prefill_attention_mask, _ = pad_inputs_to_multiple(
+            prompt_input_ids,
+            prompt_attention_mask,
+            seq_multiple=prefill_seq_multiple,
+            pad_token_id=pad_token_id,
+        )
+        prefill_outputs = prefill_runner(prefill_input_ids, prefill_attention_mask)
+        logits, past_flat = split_prefill_outputs(prefill_outputs)
+        active_positions = active_positions_from_attention_mask(prefill_attention_mask)
+        last_active_pos = int(active_positions[-1].item())
+        past_flat = compact_flattened_kv_cache(
+            past_flat,
+            active_positions=active_positions,
+        )
+        past_flat = clone_flattened_kv_cache(past_flat)
+
+        next_token = logits[:, last_active_pos, :].argmax(dim=-1, keepdim=True)
+        next_id = int(next_token.item())
+        generated_ids.append(next_id)
+        if stop_on_eos and eos_token_id is not None and next_id == eos_token_id:
+            torch.cuda.synchronize()
+            return generated_ids, time.perf_counter() - start
+
+        active_seq_len = int(past_flat[0].shape[past_flat[0].dim() - 2])
+        decode_attention_mask = torch.ones(
+            (prompt_attention_mask.shape[0], active_seq_len + 1),
+            dtype=prompt_attention_mask.dtype,
+            device=prompt_attention_mask.device,
+        )
+        decode_input_ids = next_token
+
+        for _ in range(1, max_new_tokens):
+            ensure_total_seq_limit(
+                current_total_seq_len=int(decode_attention_mask.shape[1]),
+                max_total_seq_len=max_total_seq_len,
+            )
             if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
                 torch.compiler.cudagraph_mark_step_begin()
-            model_input_ids, model_attention_mask, logit_seq_len = pad_inputs_to_multiple(
-                req_input_ids,
-                req_attention_mask,
-                seq_multiple=dynamic_seq_multiple,
-                pad_token_id=pad_token_id,
-            )
-            logits = compiled_model(model_input_ids, model_attention_mask)
-            next_token = logits[:, logit_seq_len - 1, :].argmax(dim=-1, keepdim=True)
+            decode_outputs = decode_runner(decode_input_ids, decode_attention_mask, *past_flat)
+            logits = decode_outputs[0]
+            past_flat = clone_flattened_kv_cache(tuple(decode_outputs[1:]))
+
+            next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
             next_id = int(next_token.item())
             generated_ids.append(next_id)
-
-            req_input_ids = torch.cat([req_input_ids, next_token], dim=1)
-            next_mask = torch.ones(
-                (req_attention_mask.shape[0], 1),
-                dtype=req_attention_mask.dtype,
-                device=req_attention_mask.device,
+            decode_input_ids = next_token
+            decode_attention_mask = torch.cat(
+                [
+                    decode_attention_mask,
+                    torch.ones(
+                        (decode_attention_mask.shape[0], 1),
+                        dtype=decode_attention_mask.dtype,
+                        device=decode_attention_mask.device,
+                    ),
+                ],
+                dim=1,
             )
-            req_attention_mask = torch.cat([req_attention_mask, next_mask], dim=1)
+            if stop_on_eos and eos_token_id is not None and next_id == eos_token_id:
+                break
+    torch.cuda.synchronize()
+    elapsed = time.perf_counter() - start
+    return generated_ids, elapsed
 
+
+def run_prefill_stage(
+    *,
+    prefill_runner,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    stop_on_eos: bool,
+    eos_token_id: int | None,
+    prefill_seq_multiple: int,
+    pad_token_id: int | None,
+    max_total_seq_len: int | None,
+) -> tuple[dict[str, Any], float]:
+    prompt_input_ids = input_ids.clone()
+    prompt_attention_mask = attention_mask.clone()
+    prompt_seq_len = int(prompt_input_ids.shape[1])
+
+    start = time.perf_counter()
+    with torch.inference_mode():
+        ensure_total_seq_limit(
+            current_total_seq_len=prompt_seq_len,
+            max_total_seq_len=max_total_seq_len,
+        )
+        if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+            torch.compiler.cudagraph_mark_step_begin()
+        prefill_input_ids, prefill_attention_mask, _ = pad_inputs_to_multiple(
+            prompt_input_ids,
+            prompt_attention_mask,
+            seq_multiple=prefill_seq_multiple,
+            pad_token_id=pad_token_id,
+        )
+        prefill_outputs = prefill_runner(prefill_input_ids, prefill_attention_mask)
+        logits, past_flat = split_prefill_outputs(prefill_outputs)
+        active_positions = active_positions_from_attention_mask(prefill_attention_mask)
+        last_active_pos = int(active_positions[-1].item())
+        past_flat = compact_flattened_kv_cache(
+            past_flat,
+            active_positions=active_positions,
+        )
+        past_flat = clone_flattened_kv_cache(past_flat)
+        next_token = logits[:, last_active_pos, :].argmax(dim=-1, keepdim=True)
+        next_id = int(next_token.item())
+    torch.cuda.synchronize()
+    elapsed = time.perf_counter() - start
+
+    finished = bool(stop_on_eos and eos_token_id is not None and next_id == eos_token_id)
+    active_seq_len = int(past_flat[0].shape[past_flat[0].dim() - 2])
+    decode_attention_mask = torch.ones(
+        (prompt_attention_mask.shape[0], active_seq_len + 1),
+        dtype=prompt_attention_mask.dtype,
+        device=prompt_attention_mask.device,
+    )
+    return (
+        {
+            "generated_ids": [next_id],
+            "finished": finished,
+            "past_flat": past_flat,
+            "decode_input_ids": next_token,
+            "decode_attention_mask": decode_attention_mask,
+        },
+        elapsed,
+    )
+
+
+def run_decode_stage(
+    *,
+    decode_runner,
+    prefill_state: dict[str, Any],
+    max_new_tokens: int,
+    stop_on_eos: bool,
+    eos_token_id: int | None,
+    max_total_seq_len: int | None,
+) -> tuple[list[int], float]:
+    generated_ids: list[int] = []
+    decode_input_ids = prefill_state["decode_input_ids"]
+    decode_attention_mask = prefill_state["decode_attention_mask"]
+    past_flat = clone_flattened_kv_cache(prefill_state["past_flat"])
+
+    start = time.perf_counter()
+    with torch.inference_mode():
+        for _ in range(1, max_new_tokens):
+            ensure_total_seq_limit(
+                current_total_seq_len=int(decode_attention_mask.shape[1]),
+                max_total_seq_len=max_total_seq_len,
+            )
+            if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                torch.compiler.cudagraph_mark_step_begin()
+            decode_outputs = decode_runner(decode_input_ids, decode_attention_mask, *past_flat)
+            logits = decode_outputs[0]
+            past_flat = clone_flattened_kv_cache(tuple(decode_outputs[1:]))
+            next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            next_id = int(next_token.item())
+            generated_ids.append(next_id)
+            decode_input_ids = next_token
+            decode_attention_mask = torch.cat(
+                [
+                    decode_attention_mask,
+                    torch.ones(
+                        (decode_attention_mask.shape[0], 1),
+                        dtype=decode_attention_mask.dtype,
+                        device=decode_attention_mask.device,
+                    ),
+                ],
+                dim=1,
+            )
             if stop_on_eos and eos_token_id is not None and next_id == eos_token_id:
                 break
     torch.cuda.synchronize()
@@ -341,7 +542,7 @@ def ensure_aot_runtime_compatible(
     if max_new_tokens > 1:
         raise ValueError(
             f"{mode} is static-sequence; --max-new-tokens must be 1, got {max_new_tokens}. "
-            "Use --compile-dynamic-seq-len (compile_no_preload) or prebuild a dynamic package."
+            "Build and run with dynamic sequence support for multi-token generation."
         )
 
 
@@ -414,7 +615,8 @@ def make_single_mode_metrics(args: argparse.Namespace, mode: str) -> dict[str, A
     else:
         dynamic_seq_len = False
         expected_seq_len: int | None = None
-        dynamic_seq_multiple = 1
+        prefill_seq_multiple = 1
+        max_total_seq_len: int | None = None
 
         if mode == "compile_preload":
             tokenizer_load_start = time.perf_counter()
@@ -432,18 +634,25 @@ def make_single_mode_metrics(args: argparse.Namespace, mode: str) -> dict[str, A
             input_ids = encoded_cpu["input_ids"].to(device)
             attention_mask = encoded_cpu["attention_mask"].to(device)
 
-            package_path = Path(args.package_path)
-            if not package_path.exists():
+            prefill_package_path, decode_package_path = resolve_package_paths(args, metadata)
+            if not prefill_package_path.exists():
                 raise FileNotFoundError(
-                    f"Prebuilt package not found: {package_path}. Run ./build.sh first."
+                    f"Prebuilt prefill package not found: {prefill_package_path}. Run ./build.sh first."
+                )
+            if not decode_package_path.exists():
+                raise FileNotFoundError(
+                    f"Prebuilt decode package not found: {decode_package_path}. Run ./build.sh first."
                 )
             dynamic_seq_len = bool(metadata.get("export", {}).get("dynamic_seq_len", False))
             maybe_dynamic_multiple = metadata.get("export", {}).get("dynamic_seq_multiple", 1)
             if isinstance(maybe_dynamic_multiple, int) and maybe_dynamic_multiple > 0:
-                dynamic_seq_multiple = maybe_dynamic_multiple
+                prefill_seq_multiple = maybe_dynamic_multiple
             maybe_expected = metadata.get("example", {}).get("seq_len")
             if isinstance(maybe_expected, int) and maybe_expected > 0:
                 expected_seq_len = maybe_expected
+            maybe_max_total = metadata.get("export", {}).get("effective_max_seq_len")
+            if isinstance(maybe_max_total, int) and maybe_max_total > 0:
+                max_total_seq_len = maybe_max_total
             ensure_aot_runtime_compatible(
                 mode=mode,
                 prompt_seq_len=int(input_ids.shape[1]),
@@ -451,14 +660,16 @@ def make_single_mode_metrics(args: argparse.Namespace, mode: str) -> dict[str, A
                 expected_seq_len=expected_seq_len,
                 max_new_tokens=args.max_new_tokens,
             )
-            print(f"[bench] mode=compile_preload: loading package {package_path}")
+            print(f"[bench] mode=compile_preload: loading prefill package {prefill_package_path}")
             load_start = time.perf_counter()
-            compiled_model = torch._inductor.aoti_load_package(str(package_path))
+            compiled_prefill = torch._inductor.aoti_load_package(str(prefill_package_path))
             torch.cuda.synchronize()
-            artifact_load_seconds = time.perf_counter() - load_start
+            prefill_load_seconds = time.perf_counter() - load_start
+            artifact_load_seconds = prefill_load_seconds
+            decode_load_seconds = 0.0
             mode_notes = (
-                "prebuilt .pt2 load"
-                f" (dynamic_seq_len={dynamic_seq_len}, dynamic_seq_multiple={dynamic_seq_multiple})"
+                "prebuilt .pt2 staged load (prefill then decode)"
+                f" (dynamic_seq_len={dynamic_seq_len}, prefill_seq_multiple={prefill_seq_multiple})"
             )
         else:
             model_load_start = time.perf_counter()
@@ -475,9 +686,9 @@ def make_single_mode_metrics(args: argparse.Namespace, mode: str) -> dict[str, A
             attention_mask = encoded_cpu["attention_mask"].to(device)
 
             dynamic_seq_len = bool(args.compile_dynamic_seq_len)
-            dynamic_seq_multiple = args.dynamic_seq_multiple if dynamic_seq_len else 1
-            if dynamic_seq_multiple <= 1:
-                dynamic_seq_multiple = 1
+            prefill_seq_multiple = args.dynamic_seq_multiple if dynamic_seq_len else 1
+            if prefill_seq_multiple <= 1:
+                prefill_seq_multiple = 1
 
             effective_min_seq_len = args.min_seq_len
             effective_max_seq_len = args.max_seq_len
@@ -485,8 +696,11 @@ def make_single_mode_metrics(args: argparse.Namespace, mode: str) -> dict[str, A
                 _, effective_min_seq_len, effective_max_seq_len = resolve_dynamic_seq_dim(
                     min_seq_len=args.min_seq_len,
                     max_seq_len=args.max_seq_len,
-                    seq_multiple=dynamic_seq_multiple,
+                    seq_multiple=prefill_seq_multiple,
                 )
+            else:
+                prefill_seq_multiple = 1
+            max_total_seq_len = effective_max_seq_len
 
             pad_token_id = tokenizer.pad_token_id
             if pad_token_id is None:
@@ -497,19 +711,26 @@ def make_single_mode_metrics(args: argparse.Namespace, mode: str) -> dict[str, A
             compile_input_ids, compile_attention_mask, _ = pad_inputs_to_multiple(
                 input_ids,
                 attention_mask,
-                seq_multiple=dynamic_seq_multiple,
+                seq_multiple=prefill_seq_multiple,
                 pad_token_id=pad_token_id,
             )
 
-            wrapped = CausalLMLogitsWrapper(model).eval()
+            prefill_wrapper = CausalLMPrefillWrapper(model).eval()
+            decode_wrapper = CausalLMDecodeWrapper(model).eval()
             compile_mode = "max-autotune" if args.max_autotune else "default"
             print(
-                "[bench] mode=compile_no_preload: compiling model with torch.compile "
+                "[bench] mode=compile_no_preload: compiling prefill+decode wrappers with torch.compile "
                 f"(dynamic_seq_len={dynamic_seq_len}, compile_mode={compile_mode}, fullgraph=True)"
             )
             build_start = time.perf_counter()
-            compiled_model = torch.compile(
-                wrapped,
+            compiled_prefill = torch.compile(
+                prefill_wrapper,
+                mode=compile_mode,
+                fullgraph=True,
+                dynamic=dynamic_seq_len,
+            )
+            compiled_decode = torch.compile(
+                decode_wrapper,
                 mode=compile_mode,
                 fullgraph=True,
                 dynamic=dynamic_seq_len,
@@ -517,14 +738,40 @@ def make_single_mode_metrics(args: argparse.Namespace, mode: str) -> dict[str, A
             with torch.inference_mode():
                 if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
                     torch.compiler.cudagraph_mark_step_begin()
-                _ = compiled_model(compile_input_ids, compile_attention_mask)
+                warm_prefill_outputs = compiled_prefill(compile_input_ids, compile_attention_mask)
+                warm_logits, warm_past_flat = split_prefill_outputs(warm_prefill_outputs)
+                warm_active_positions = active_positions_from_attention_mask(
+                    compile_attention_mask
+                )
+                warm_last_pos = int(warm_active_positions[-1].item())
+                warm_past_flat = compact_flattened_kv_cache(
+                    warm_past_flat,
+                    active_positions=warm_active_positions,
+                )
+                warm_past_flat = clone_flattened_kv_cache(warm_past_flat)
+                warm_next = warm_logits[:, warm_last_pos, :].argmax(
+                    dim=-1, keepdim=True
+                )
+                warm_active_len = int(warm_past_flat[0].shape[warm_past_flat[0].dim() - 2])
+                warm_decode_mask = torch.ones(
+                    (attention_mask.shape[0], warm_active_len + 1),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                )
+                ensure_total_seq_limit(
+                    current_total_seq_len=int(warm_decode_mask.shape[1]),
+                    max_total_seq_len=max_total_seq_len,
+                )
+                if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                    torch.compiler.cudagraph_mark_step_begin()
+                _ = compiled_decode(warm_next, warm_decode_mask, *warm_past_flat)
             torch.cuda.synchronize()
             artifact_build_seconds = time.perf_counter() - build_start
             artifact_load_seconds = 0.0
             mode_notes = (
-                "runtime torch.compile"
+                "runtime torch.compile prefill+decode"
                 f" (dynamic_seq_len={dynamic_seq_len}, "
-                f"dynamic_seq_multiple={dynamic_seq_multiple}, "
+                f"prefill_seq_multiple={prefill_seq_multiple}, "
                 f"reference_seq=[{effective_min_seq_len}, {effective_max_seq_len}], "
                 f"compile_mode={compile_mode}, fullgraph=True)"
             )
@@ -533,28 +780,96 @@ def make_single_mode_metrics(args: argparse.Namespace, mode: str) -> dict[str, A
         pad_token_id = tokenizer.pad_token_id
         if pad_token_id is None:
             pad_token_id = eos_token_id
-        for request_idx in range(args.num_requests):
-            generated_ids, elapsed = run_aot_request(
-                compiled_model=compiled_model,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=args.max_new_tokens,
-                stop_on_eos=args.stop_on_eos,
-                eos_token_id=eos_token_id,
-                dynamic_seq_multiple=dynamic_seq_multiple if dynamic_seq_len else 1,
-                pad_token_id=pad_token_id,
-            )
-            request_latencies.append(elapsed)
-            total_new_tokens += len(generated_ids)
-            if request_idx == 0:
-                first_completion = tokenizer.decode(
-                    generated_ids,
-                    skip_special_tokens=True,
-                ).strip()
-            print(
-                f"[bench] mode={mode} request={request_idx + 1}/{args.num_requests} "
-                f"latency={elapsed:.2f}s"
-            )
+        if mode == "compile_preload":
+            request_latencies = [0.0 for _ in range(args.num_requests)]
+            request_outputs: list[list[int]] = [[] for _ in range(args.num_requests)]
+            pending_decode: list[tuple[int, dict[str, Any]]] = []
+
+            for request_idx in range(args.num_requests):
+                prefill_state, prefill_elapsed = run_prefill_stage(
+                    prefill_runner=compiled_prefill,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    stop_on_eos=args.stop_on_eos,
+                    eos_token_id=eos_token_id,
+                    prefill_seq_multiple=prefill_seq_multiple,
+                    pad_token_id=pad_token_id,
+                    max_total_seq_len=max_total_seq_len,
+                )
+                request_latencies[request_idx] = prefill_elapsed
+                if args.max_new_tokens <= 1 or prefill_state["finished"]:
+                    request_outputs[request_idx] = list(prefill_state["generated_ids"])
+                    print(
+                        f"[bench] mode={mode} request={request_idx + 1}/{args.num_requests} "
+                        f"latency={prefill_elapsed:.2f}s"
+                    )
+                else:
+                    pending_decode.append((request_idx, prefill_state))
+
+            del compiled_prefill
+            torch.cuda.empty_cache()
+
+            if pending_decode:
+                print(f"[bench] mode=compile_preload: loading decode package {decode_package_path}")
+                decode_load_start = time.perf_counter()
+                compiled_decode = torch._inductor.aoti_load_package(str(decode_package_path))
+                torch.cuda.synchronize()
+                decode_load_seconds = time.perf_counter() - decode_load_start
+                artifact_load_seconds += decode_load_seconds
+
+                for request_idx, prefill_state in pending_decode:
+                    extra_ids, decode_elapsed = run_decode_stage(
+                        decode_runner=compiled_decode,
+                        prefill_state=prefill_state,
+                        max_new_tokens=args.max_new_tokens,
+                        stop_on_eos=args.stop_on_eos,
+                        eos_token_id=eos_token_id,
+                        max_total_seq_len=max_total_seq_len,
+                    )
+                    generated_ids = list(prefill_state["generated_ids"])
+                    generated_ids.extend(extra_ids)
+                    request_outputs[request_idx] = generated_ids
+                    request_latencies[request_idx] += decode_elapsed
+                    print(
+                        f"[bench] mode={mode} request={request_idx + 1}/{args.num_requests} "
+                        f"latency={request_latencies[request_idx]:.2f}s"
+                    )
+                del compiled_decode
+                torch.cuda.empty_cache()
+
+            for request_idx in range(args.num_requests):
+                generated_ids = request_outputs[request_idx]
+                total_new_tokens += len(generated_ids)
+                if request_idx == 0:
+                    first_completion = tokenizer.decode(
+                        generated_ids,
+                        skip_special_tokens=True,
+                    ).strip()
+        else:
+            for request_idx in range(args.num_requests):
+                generated_ids, elapsed = run_kv_request(
+                    prefill_runner=compiled_prefill,
+                    decode_runner=compiled_decode,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=args.max_new_tokens,
+                    stop_on_eos=args.stop_on_eos,
+                    eos_token_id=eos_token_id,
+                    prefill_seq_multiple=prefill_seq_multiple,
+                    pad_token_id=pad_token_id,
+                    max_total_seq_len=max_total_seq_len,
+                )
+                request_latencies.append(elapsed)
+                total_new_tokens += len(generated_ids)
+                if request_idx == 0:
+                    first_completion = tokenizer.decode(
+                        generated_ids,
+                        skip_special_tokens=True,
+                    ).strip()
+                print(
+                    f"[bench] mode={mode} request={request_idx + 1}/{args.num_requests} "
+                    f"latency={elapsed:.2f}s"
+                )
 
     first_latency = request_latencies[0]
     tail_latencies = request_latencies[1:] if len(request_latencies) > 1 else request_latencies
@@ -576,7 +891,6 @@ def make_single_mode_metrics(args: argparse.Namespace, mode: str) -> dict[str, A
         "num_requests": args.num_requests,
         "request_latencies": request_latencies,
         "first_request_seconds": first_latency,
-        # TTFT measured after model/package is already available in-process.
         "ttft_after_ready_seconds": first_latency,
         "tail_mean_seconds": float(statistics.mean(tail_latencies)),
         "mean_request_seconds": mean_request_seconds,
@@ -584,15 +898,11 @@ def make_single_mode_metrics(args: argparse.Namespace, mode: str) -> dict[str, A
         "p90_request_seconds": percentile(request_latencies, 0.90),
         "total_generation_seconds": total_generation_seconds,
         "total_script_seconds": total_script_seconds,
-        # Includes first request (captures first-token startup effects).
         "tokens_per_second": safe_tps(total_new_tokens, total_generation_seconds),
         "tokens_per_second_all": safe_tps(total_new_tokens, total_generation_seconds),
-        # Excludes first request to show steady-state throughput.
         "tail_tokens_per_second": safe_tps(tail_tokens, tail_generation_seconds),
         "steady_state_tokens_per_second": safe_tps(tail_tokens, tail_generation_seconds),
-        # Includes compile/load/model startup and all requests.
         "end_to_end_tokens_per_second": safe_tps(total_new_tokens, total_script_seconds),
-        # TTFT from process start (includes load/compile work).
         "ttft_cold_start_seconds": cold_start_first_request_seconds,
         "cold_start_first_request_seconds": cold_start_first_request_seconds,
         "tokenizer_load_seconds": tokenizer_load_seconds,
@@ -607,6 +917,7 @@ def make_single_mode_metrics(args: argparse.Namespace, mode: str) -> dict[str, A
         "cache_implementation": args.cache_implementation,
         "mode_notes": mode_notes,
         "first_completion": first_completion,
+        "kv_cache": mode != "eager",
     }
 
 
@@ -655,6 +966,8 @@ def build_subprocess_cmd(args: argparse.Namespace, mode: str) -> list[str]:
         "--dynamic-seq-multiple",
         str(args.dynamic_seq_multiple),
     ]
+    if args.decode_package_path.strip():
+        cmd.extend(["--decode-package-path", args.decode_package_path])
     cmd.append("--bucket-pad" if args.bucket_pad else "--no-bucket-pad")
     cmd.append("--stop-on-eos" if args.stop_on_eos else "--no-stop-on-eos")
     if args.compile_dynamic_seq_len:
